@@ -1,6 +1,7 @@
 # Copyright 2017-2020 Palantir Technologies, Inc.
 # Copyright 2021- Python Language Server Contributors.
 
+from ast import parse
 import logging
 import threading
 
@@ -11,6 +12,8 @@ except Exception:  # pylint: disable=broad-except
 
 log = logging.getLogger(__name__)
 
+CANCEL_METHOD = '$/cancelRequest'
+
 
 class JsonRpcStreamReader:
     def __init__(self, rfile):
@@ -19,12 +22,23 @@ class JsonRpcStreamReader:
     def close(self):
         self._rfile.close()
 
+    def _process_messages(self, message_consumer, messages: dict):
+        """
+        process messages one by one using message_consumer
+        """
+        for id,message in messages.items():
+            message_consumer(message)
+
+        messages.clear()
+
     def listen(self, message_consumer):
         """Blocking call to listen for messages on the rfile.
 
         Args:
             message_consumer (fn): function that is passed each message as it is read off the socket.
         """
+
+        requests = {}
         while not self._rfile.closed:
             try:
                 request_str = self._read_message()
@@ -34,13 +48,26 @@ class JsonRpcStreamReader:
                 log.exception("Failed to read from rfile")
 
             if request_str is None:
+                log.debug("None received. Breaking ....")
+                if requests is not None:
+                    self._process_messages(message_consumer, requests)
                 break
 
             try:
-                message_consumer(json.loads(request_str.decode('utf-8')))
+                parsed_request = json.loads(request_str.decode('utf-8'))
             except ValueError:
                 log.exception("Failed to parse JSON message %s", request_str)
                 continue
+
+            if parsed_request['method'] == CANCEL_METHOD:
+                log.debug("Cancel notification received. Processing requests")
+                #remove the corrresponding id
+                id = parsed_request['params']['id']
+                del requests[id]
+                #process the rest of the messages
+                self._process_messages(message_consumer, requests)
+
+            requests[parsed_request['id']] = parsed_request
 
     def _read_message(self):
         """Reads the contents of a message.
